@@ -1,0 +1,202 @@
+// greysealpups_Deads_estTTMTTL.stan
+// Full model with explicit mortality, estimated TTM and TTL
+
+functions {
+    
+    vector skewnormBDFunction(real mu, real sigma, real alpha, int nsteps, vector days){
+    vector[nsteps] xvec;
+    for (i in 1:nsteps) {
+      xvec[i] = exp(skew_normal_lpdf(days[i] | mu, sigma, alpha));
+    }
+    return xvec / sum(xvec);
+  }
+
+  vector hazFunction(real mu, real std, int nsteps, int dstep){
+    real prob;
+    vector[nsteps] hazprob;
+    hazprob[1] = normal_cdf((1*dstep)|mu,std);
+    for (s in 2:nsteps){
+      prob = normal_cdf((s*dstep)|mu,std) - normal_cdf(((s-1)*dstep)|mu,std);
+      hazprob[s] = (1-normal_cdf(((s-1)*dstep)|mu,std))<0.000001 ? 1.0 : prob/(1-normal_cdf(((s-1)*dstep)|mu,std));
+    }
+    return(hazprob);
+  }
+  
+  // Transition matrix: option: whitecoats CANNOT leave directly (forced moult before leaving)
+  matrix transMatrix(real xphi, real xgamma, real xzeta, real xchi, int stages, int dstep){
+    matrix[stages,stages] matarray = rep_matrix(0,stages,stages); 
+    matarray[1,1] = xphi^dstep * (1-xgamma) * (1-xzeta);  // W to W
+    matarray[2,1] = xphi^dstep * xgamma * (1-xzeta);       // W to M
+    // matarray[3,1] = xphi^dstep * xzeta;                  // W to LA - REMOVED (force moult)
+    matarray[4,1] = (1-xphi^dstep);                         // W to D
+    matarray[2,2] = xphi^dstep * (1-xzeta);                 // M to M
+    matarray[3,2] = xphi^dstep * xzeta;                     // M to LA
+    matarray[4,2] = (1-xphi^dstep);                         // M to D
+    matarray[4,4] = xchi^dstep;                              // D to D
+    matarray[5,4] = 1-xchi^dstep;                            // D to LD
+    matarray[3,3] = 1;                                       // LA absorbing
+    matarray[5,5] = 1;                                       // LD absorbing
+    return(matarray);
+  }
+  
+} // end of functions block
+
+
+data {
+  int <lower=0> nstates;
+  int <lower=0> maxDayBirth;
+  int <lower=0> ndays;
+  int <lower=0> nobsstates;
+  int <lower=0> nsurveys;
+  array[nsurveys, nobsstates] int obs_vector;
+  array[nsurveys] int <lower=0> obsdays;
+  
+  // Detection and classification rates (passed from R)
+  real<lower=0,upper=1> pobs_w;
+  real<lower=0,upper=1> pobs_m;
+  real<lower=0,upper=1> pobs_d;
+  real<lower=0,upper=1> pcm;
+  real<lower=0,upper=1> pcw;
+}
+ 
+transformed data {
+  int <lower=0> daysPerBin = 4;
+  int nIntervals_s = ndays / daysPerBin;
+  
+  array[nsurveys] int <lower=0> obsdays_bin; 
+  for (z in 1:nsurveys) obsdays_bin[z] = obsdays[z] / daysPerBin;
+  
+  // Cohort bins
+  int <lower=0> nIntervals_c = 25;
+  vector[nIntervals_c] cohort_days;
+  for (z in 1:nIntervals_c) {
+    cohort_days[z] = z * daysPerBin - 2.0;
+  } 
+  
+  // Survival
+  real <lower=0> survInt = 4;
+  real <lower=0> survSlope = 0.1;  
+  vector <lower=0,upper=1>[ndays] xphi;
+  for (a in 1:ndays) {
+    xphi[a] = inv_logit(survInt + survSlope * (a-1));
+  }
+  
+  // Carcass persistence
+  real <lower=0> pcarcSurvInt = 4;
+  vector <lower=0,upper=1>[ndays] xchi;
+  for (a in 1:ndays) {
+    xchi[a] = inv_logit(pcarcSurvInt);
+  }
+  
+} // end of transformed data block
+
+parameters {
+  real nborn_raw;
+  real muBday_raw;
+  real<lower=0> sdBday_raw;
+  real<lower=0> alphaBday_raw;
+  
+  // Transition parameters (estimated)
+  real muLeave_raw;
+  real<lower=0> sdLeave_raw;
+  real muMoult_raw;
+  real<lower=0> sdMoult_raw;
+}
+
+transformed parameters {
+  real nborn = exp(5 + 2 * nborn_raw);
+  real muBday = exp(3.8 + 0.15 * muBday_raw);
+  real sdBday = sdBday_raw * 6;
+  real alphaBday = alphaBday_raw * 4;
+
+  // Estimated transition parameters
+  real muMoult = 23 + muMoult_raw * 2;
+  real sdMoult = 1 + sdMoult_raw * 4;
+  real muLeave = 30 + muLeave_raw * 2.5;
+  real sdLeave = 1 + sdLeave_raw * 5;
+
+  // Birth process
+  vector[nIntervals_c] Pb;
+  Pb = skewnormBDFunction(muBday, sdBday, alphaBday, nIntervals_c, cohort_days);  
+
+  // Moult process (estimated)
+  vector<lower=0,upper=1>[ndays %/% daysPerBin] xgamma;
+  xgamma = hazFunction(muMoult, sdMoult, nIntervals_s, daysPerBin);
+
+  // Leave process (estimated)
+  vector[nIntervals_s] xzeta;
+  xzeta = hazFunction(muLeave, sdLeave, nIntervals_s, daysPerBin);
+
+  // Distribute births across cohorts
+  vector[nIntervals_c] cohortSizeBin; 
+  cohortSizeBin = nborn * Pb;
+
+  // Transition matrices (one per age interval)
+  array[nIntervals_s] matrix[nstates, nstates] matarray;
+  for (i in 1:nIntervals_s) {
+    matarray[i] = transMatrix(xphi[((i-1)*daysPerBin)+1], xgamma[i], xzeta[i], xchi[((i-1)*daysPerBin)+1], nstates, daysPerBin);
+  }
+
+  // Accumulate stage counts across cohorts and time
+  vector[nstates] tempCohortVec;
+  array[nIntervals_s] vector[nstates] stageN;
+  for (z in 1:nIntervals_s) stageN[z] = rep_vector(0, nstates);
+
+  for (c in 1:nIntervals_c) {
+    tempCohortVec = rep_vector(0, nstates);
+    tempCohortVec[1] = cohortSizeBin[c];
+    stageN[c] += tempCohortVec;
+    for (a in 1:(nIntervals_s-c)) {
+      tempCohortVec = matarray[a] * tempCohortVec;
+      stageN[c+a] += tempCohortVec;
+    }
+  }
+
+  // Observation matrix
+  matrix[nstates, nobsstates+1] obsMatrix = rep_matrix(0, nstates, nobsstates+1); 
+  obsMatrix[1,1] = pobs_w * pcw;
+  obsMatrix[1,2] = pobs_w * (1 - pcw);
+  obsMatrix[1,4] = 1 - pobs_w;
+  obsMatrix[2,1] = pobs_m * (1 - pcm);
+  obsMatrix[2,2] = pobs_m * pcm;
+  obsMatrix[2,4] = 1 - pobs_m;
+  obsMatrix[3,4] = 1;
+  obsMatrix[4,3] = pobs_d;
+  obsMatrix[4,4] = 1 - pobs_d;
+  obsMatrix[5,4] = 1;
+
+  array[nsurveys] row_vector[nobsstates + 1] lambda_obs_vector;
+  for (obs in 1:nsurveys) {
+    lambda_obs_vector[obs] = stageN[obsdays_bin[obs]]' * obsMatrix;
+  }
+}
+
+model {
+  // Priors - birth process
+  nborn_raw ~ std_normal();  
+  muBday_raw ~ normal(0, 1);
+  sdBday_raw ~ gamma(2, 1);
+  alphaBday_raw ~ normal(0.8, 0.5); 
+  
+  // Priors - transition processes (estimated)
+  muMoult_raw ~ normal(1.5, 1);
+  sdMoult_raw ~ gamma(2, 1);
+  muLeave_raw ~ student_t(3, 0, 2);
+  sdLeave_raw ~ gamma(1, 1);
+
+  // Likelihood
+  for (obs in 1:nsurveys) {
+    obs_vector[obs, 1] ~ poisson(lambda_obs_vector[obs, 1]);
+    obs_vector[obs, 2] ~ poisson(lambda_obs_vector[obs, 2]);
+    obs_vector[obs, 3] ~ poisson(lambda_obs_vector[obs, 3]);
+  }
+}
+
+generated quantities {
+  array[nsurveys, nobsstates] int yrep;
+  for (obs in 1:nsurveys) {
+    for (j in 1:nobsstates) {
+      yrep[obs, j] = poisson_rng(lambda_obs_vector[obs, j]);
+    }
+  }
+}
