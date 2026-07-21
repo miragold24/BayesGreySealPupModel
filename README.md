@@ -1,5 +1,5 @@
 # BayesGreySealPupModel
-Bayesian state-space model to estimate grey seal pup production from serial aerial surveys, with survival and carcass persistence explicitly modelled. Code and data accompanying Goldman et al. (submitted to RSOS). 
+Bayesian state-space model to estimate grey seal pup production from serial aerial surveys, with survival and carcass persistence explicitly modelled. Code and data accompanying Goldman et al. (Accepted/In Press, Royal Society Open Science). 
 
 R script and model code descriptions: 
 
